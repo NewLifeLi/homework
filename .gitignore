@@ -1,16 +1,23 @@
-﻿venv/
-.env/
-.venv/
+﻿# Byte-compiled / cache
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
 *.pyd
-*.egg-info/
 .ipynb_checkpoints/
+
+# Data & outputs (re-generate on Colab)
 data/
 runs/
 *.pt
-.DS_Store
-Thumbs.db
+*.pth
+*.ckpt
+*.png
+*.pdf
+
+# IDE
 .vscode/
 .idea/
+
+# OS
+.DS_Store
+Thumbs.db

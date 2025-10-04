@@ -6,6 +6,13 @@ main.py
 Changes for Step 4:
 - Add CLI flag --make_figs to generate 10 publication-style figures into runs/figs/
   after (g) finishes and artifacts (runs/val_grid.csv, runs/test_pred.pt) exist.
+
+Added: controlled execution for (c) naive broadcast
+- --run_naive actually runs (c) on a user-defined subset to avoid OOM
+- --naive_max_nte / --naive_max_ntr bound N_test / N_train used in (c)
+- --naive_half to use float16 in (c) to halve memory
+- --naive_device {cuda|cpu} to choose device for (c)
+- --naive_mem_gib_limit safety guard: abort (c) if estimated memory exceeds the limit
 """
 from __future__ import annotations
 import argparse
@@ -47,8 +54,20 @@ def parse_args():
     p.add_argument("--min_batch_size", type=int, default=32, help="Lower bound for adaptive batch size")
     p.add_argument("--half", action="store_true", help="Store tensors as float16 on CUDA (experimental)")
 
-    # (c) skip naive broadcast (OOM demo)
+    # (c) naive broadcast options
     p.add_argument("--skip_naive", action="store_true", help="Skip (c) naive broadcast (OOM demonstration)")
+    p.add_argument("--run_naive", action="store_true",
+                   help="Actually run (c) naive broadcast on a bounded subset to avoid OOM")
+    p.add_argument("--naive_max_nte", type=int, default=64,
+                   help="(c) max number of validation/test samples used (default 64)")
+    p.add_argument("--naive_max_ntr", type=int, default=5000,
+                   help="(c) max number of training samples used (default 5000)")
+    p.add_argument("--naive_half", action="store_true",
+                   help="(c) use float16 tensors to reduce memory (default off)")
+    p.add_argument("--naive_device", type=str, default="cuda", choices=["cuda", "cpu"],
+                   help="(c) device used for naive broadcast (default cuda)")
+    p.add_argument("--naive_mem_gib_limit", type=float, default=6.5,
+                   help="(c) abort if estimated memory (GiB) exceeds this limit (default 6.5 GiB)")
 
     # (e)(f) grid search — default ON
     p.add_argument("--do_grid", dest="do_grid", action="store_true", help="Run grid search (default on)")
@@ -121,20 +140,67 @@ def main():
     same = (pred_a == pred_b)
     print(f"(b) pred={pred_b} gt={gt0} time={t_b:.3f}s (same as (a)? {same})")
 
-    # ===== (c) naive broadcast (demo; possible OOM) =====
+    # ===== (c) naive broadcast (demo or controlled run) =====
     print("\n==== (c) naive broadcast: full-val demo ====")
-    if args.skip_naive:
+    if args.skip_naive and not args.run_naive:
         print("(c) skipped by --skip_naive")
     else:
-        try:
-            t0 = time.time()
-            y_pred_c = knn_all_naive_broadcast(X_val.to(device), X_train.to(device), y_train.to(device),
-                                               args.k, args.metric, args.vote)
-            t_c = time.time() - t0
-            acc_c = accuracy(y_pred_c, y_val.to(device))
-            print(f"(c) val_acc={acc_c:.4f} time={t_c:.3f}s  [note: huge memory usage]")
-        except RuntimeError as e:
-            print(f"(c) failed (likely OOM): {str(e)[:200]}")
+        # Controlled execution to avoid OOM: bound Nte/Ntr, choose dtype/device, and precheck memory.
+        # Memory ~ Nte * Ntr * D * bytes_per_elem (MNIST D=784).
+        import math
+
+        Xtr_full, ytr_full = X_train, y_train
+        Xte_full, yte_full = X_val,   y_val
+
+        # Subset sizes
+        nte = min(len(yte_full), args.naive_max_nte)
+        ntr = min(len(ytr_full), args.naive_max_ntr)
+
+        Xtr = Xtr_full[:ntr].contiguous()
+        ytr = ytr_full[:ntr].contiguous()
+        Xte = Xte_full[:nte].contiguous()
+        yte = yte_full[:nte].contiguous()
+
+        # dtype & device for (c) only
+        _dtype = torch.float16 if args.naive_half else torch.float32
+        dev = torch.device(args.naive_device if args.naive_device == "cpu"
+                           else ("cuda" if torch.cuda.is_available() else "cpu"))
+
+        Xtr = Xtr.to(_dtype)
+        Xte = Xte.to(_dtype)
+
+        # estimate memory (GiB)
+        D = Xtr.shape[1] if Xtr.dim() == 2 else int(torch.prod(torch.tensor(Xtr.shape[1:])))
+        bytes_per = 2 if _dtype == torch.float16 else 4
+        est_bytes = int(nte) * int(ntr) * int(D) * bytes_per
+        est_gib = est_bytes / (1024**3)
+
+        print(f"(c) plan: Nte={nte}, Ntr={ntr}, D={D}, dtype={str(_dtype).split('.')[-1]}, "
+              f"dev={dev.type}, est_mem≈{est_gib:.2f} GiB")
+        if est_gib > args.naive_mem_gib_limit:
+            print(f"(c) aborted: estimated memory {est_gib:.2f} GiB exceeds limit "
+                  f"{args.naive_mem_gib_limit:.2f} GiB. "
+                  f"Consider lowering --naive_max_nte/--naive_max_ntr, adding --naive_half, "
+                  f"or using --naive_device cpu.")
+        else:
+            try:
+                t0 = time.time()
+                # move after dtype cast to avoid extra copies
+                Xtr_d = Xtr.to(dev, non_blocking=True)
+                Xte_d = Xte.to(dev, non_blocking=True)
+                ytr_d = ytr.to(dev, non_blocking=True)
+
+                y_pred_c = knn_all_naive_broadcast(
+                    Xte_d, Xtr_d, ytr_d,
+                    args.k, args.metric, args.vote
+                )
+                t_c = time.time() - t0
+                acc_c = accuracy(y_pred_c, yte.to(dev))
+                per_img_c = t_c / max(1, len(yte))
+                print(f"(c) val_acc@subset={acc_c:.4f} time={t_c:.3f}s "
+                      f"({per_img_c*1e3:.3f} ms/img on {dev})  [naive broadcast • controlled subset]")
+            except RuntimeError as e:
+                print(f"(c) failed (likely OOM): {str(e)[:200]}")
 
     # ===== (d) batched cdist (adaptive & fallback) =====
     print("\n==== (d) batched cdist on validation (adaptive batch) ====")

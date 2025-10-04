@@ -403,21 +403,166 @@ def fig_top1_distance_hist(csv_path: str, pt_path: str, out_path: str, sample: i
 
 
 # ---------------------------
-# Figure 10: Naive broadcast memory curve
+# Figure 10: Naive broadcast memory curve (empirical run on CUDA; fallback to theoretical)
 # ---------------------------
-def fig_naive_memory_curve(out_path: str, ntr: int = 54000, d: int = 784, dtype_bytes: int = 4):
-    # mem ≈ Nte * Ntr * D * dtype_bytes (bytes)
-    ntes = np.linspace(0, 10000, 50)
-    mem_gib = ntes * ntr * d * dtype_bytes / (1024**3)
+def fig_naive_memory_curve(
+    out_path: str,
+    ntr: int = 54000,
+    d: int = 784,
+    dtype_bytes: int = 2,           # 2 -> float16 (matches your fp16 run); use 4 for float32
+    device: str = "cuda",
+    nte_points: Optional[Sequence[int]] = None,
+    seed: int = 0,
+):
+    """
+    Empirically measure peak memory and time when running the naive broadcast (c).
+    - If CUDA is available and device='cuda', we run real allocations and record:
+        * peak GPU memory (GiB) via torch.cuda.max_memory_allocated()
+        * wall-clock time (s)
+      for increasing N_test (nte_points). OOM is caught and we stop growing N_test.
+    - If CUDA is not available (or device='cpu'), we fall back to a theoretical curve.
 
+    Args:
+        out_path: output PNG path
+        ntr: number of train samples used in the run
+        d: feature dimension
+        dtype_bytes: 2 for float16, 4 for float32 (used for both dtype choice and theoretical fallback)
+        device: 'cuda' or 'cpu' for the empirical attempt
+        nte_points: list of N_test values to try; defaults to a safe monotonic sequence
+        seed: RNG seed for reproducibility
+    """
+    import time
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+    from .knn import knn_all_naive_broadcast
+
+    rng = np.random.RandomState(seed)
+    torch.manual_seed(seed)
+
+    # dtype selection from dtype_bytes
+    if dtype_bytes == 2:
+        torch_dtype = torch.float16
+        dtype_tag = "float16"
+    elif dtype_bytes == 4:
+        torch_dtype = torch.float32
+        dtype_tag = "float32"
+    else:
+        torch_dtype = torch.float32
+        dtype_tag = "float32"
+
+    use_cuda = (device == "cuda") and torch.cuda.is_available()
+    if nte_points is None:
+        # Reasonable, increasing sequence; adjust if needed
+        nte_points = [32, 64, 128, 192, 224, 256, 320, 384, 512]
+
+    # containers
+    ntes = np.array(nte_points, dtype=np.int32)
+    peak_mem_gib = np.full_like(ntes, fill_value=np.nan, dtype=np.float64)
+    wall_time_s  = np.full_like(ntes, fill_value=np.nan, dtype=np.float64)
+
+    # style
     set_nature_rc()
     plt.figure(figsize=(3.35, 2.4))
-    plt.plot(ntes, mem_gib, marker="o")
-    plt.xlabel("N_test")
-    plt.ylabel("Theoretical memory (GiB)")
-    plt.title("Naive broadcast memory growth")
-    plt.savefig(out_path)
+
+    if use_cuda:
+        dev = torch.device("cuda")
+
+        # Build train set once (content does not affect peak)
+        Xtr = torch.randn(ntr, d, dtype=torch_dtype, device=dev)
+        ytr = torch.from_numpy(rng.randint(0, 10, size=(ntr,))).to(dev)
+
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+        for idx, nte in enumerate(ntes):
+            Xte = None
+            try:
+                Xte = torch.randn(nte, d, dtype=torch_dtype, device=dev)
+
+                torch.cuda.reset_peak_memory_stats(dev)
+                t0 = time.time()
+
+                # Memory-heavy path: l2 distance (allocates [Nte, Ntr, D] inside)
+                _ = knn_all_naive_broadcast(Xte, Xtr, ytr, k=5, metric="l2", vote="majority")
+
+                torch.cuda.synchronize()
+                t1 = time.time()
+                wall_time_s[idx] = t1 - t0
+
+                peak = torch.cuda.max_memory_allocated(dev) / (1024 ** 3)
+                peak_mem_gib[idx] = float(peak)
+
+            except RuntimeError as e:
+                msg = str(e).lower()
+                if "out of memory" in msg:
+                    print(f"[FIG10] OOM at N_test={nte} on CUDA ({dtype_tag}); stopping growth.")
+                    # Stop increasing N_test; keep already measured points
+                    break
+                else:
+                    print(f"[FIG10] RuntimeError at N_test={nte}: {str(e)[:120]}")
+                    # Continue to next point if it was not an OOM
+                    continue
+            finally:
+                # cleanup per-iteration
+                if Xte is not None:
+                    del Xte
+                torch.cuda.empty_cache()
+
+        # Plot empirical (only valid points)
+        valid = ~np.isnan(peak_mem_gib)
+        if valid.any():
+            plt.plot(ntes[valid], peak_mem_gib[valid], marker="o",
+                     label=f"Empirical peak (CUDA, {dtype_tag})")
+
+        # Overlay theoretical reference (use same x domain actually attempted)
+        theo = ntes * ntr * d * dtype_bytes / (1024 ** 3)
+        plt.plot(ntes, theo, linestyle="--", label="Theoretical (bytes only)")
+
+        # Secondary axis for time (if any point succeeded)
+        ax = plt.gca()
+        ax2 = ax.twinx()
+        if valid.any() and np.any(~np.isnan(wall_time_s)):
+            ax2.plot(ntes[valid], wall_time_s[valid], marker="s", linestyle=":",
+                     label="Wall time (s)", alpha=0.85)
+            ax2.set_ylabel("Wall time (s)")
+            # Correctly merge legends from both axes
+            handles1, labels1 = ax.get_legend_handles_labels()
+            handles2, labels2 = ax2.get_legend_handles_labels()
+            handles = handles1 + handles2
+            labels = labels1 + labels2
+            ax2.legend(handles, labels, loc="upper left")
+
+        plt.xlabel("N_test")
+        plt.ylabel("Peak GPU memory (GiB)")
+        plt.title("Naive broadcast: empirical memory & time")
+
+        # If no empirical point succeeded (all NaN), fall back to theoretical-only plot text
+        if not valid.any():
+            plt.cla()  # clear and redraw theoretical-only view
+            theo_x = np.linspace(0, max(ntes) if len(ntes) else 1024, 20, dtype=float)
+            theo_y = theo_x * ntr * d * dtype_bytes / (1024 ** 3)
+            plt.plot(theo_x, theo_y, marker="o", label="Theoretical (bytes only)")
+            plt.xlabel("N_test")
+            plt.ylabel("Peak GPU memory (GiB)")
+            plt.title("Naive broadcast memory growth (theoretical only; empirical OOM)")
+            plt.legend(loc="upper left")
+
+    else:
+        # CPU or no CUDA: theoretical only
+        ntes_float = np.linspace(0, 10000, 50, dtype=float)
+        mem_gib = ntes_float * ntr * d * dtype_bytes / (1024 ** 3)
+        plt.plot(ntes_float, mem_gib, marker="o", label="Theoretical (bytes only)")
+        plt.xlabel("N_test")
+        plt.ylabel("Theoretical memory (GiB)")
+        plt.title("Naive broadcast memory growth (theoretical only)")
+        plt.legend(loc="upper left")
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
     plt.close()
+
+
 
 
 # ---------------------------

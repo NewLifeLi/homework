@@ -110,67 +110,95 @@ def vote_labels(
     metric: Metric
 ) -> torch.Tensor:
     """
-    Aggregation over k neighbors.
-    - majority: majority vote; on tie, prefer the class with smaller total distance (or larger total similarity for cosine),
-      then fall back to the smallest label id.
-    - distance: weighted vote; l1/l2 use 1/(dist+eps), cosine uses similarity = (1 - distance).
+    Aggregate k neighbors into a single class label with deterministic tie-breaking.
+    Rules:
+      - majority: pick the class with most votes;
+                  on tie -> prefer (cosine) larger total similarity or (l1/l2) smaller total distance;
+                  still tie -> pick the smallest label id.
+      - distance: weighted vote;
+                  (l1/l2) weight = 1/(dist + eps);
+                  (cosine) weight = clamp(1 - dist, 0) + eps (avoid negative weights);
+                  on tie -> pick the smallest label id.
     """
     eps = 1e-12
+
+    # Ensure 2D
     if neighbor_labels.dim() == 1:
-        neighbor_labels = neighbor_labels.unsqueeze(0)  # [1, k]
+        neighbor_labels = neighbor_labels.unsqueeze(0)
         if neighbor_scores is not None:
             neighbor_scores = neighbor_scores.unsqueeze(0)
 
     B, K = neighbor_labels.shape
-    preds = torch.zeros(B, dtype=torch.long, device=neighbor_labels.device)
+    device = neighbor_labels.device
+    preds = torch.empty(B, dtype=torch.long, device=device)
 
     for i in range(B):
         labs = neighbor_labels[i]  # [k]
+
         if vote == 'majority':
+            # Count votes per class present in this top-k set
             unique, counts = torch.unique(labs, return_counts=True)
             max_count = counts.max()
-            cand = unique[counts == max_count]
+            cand = unique[counts == max_count]  # candidates after majority vote
+
             if cand.numel() == 1:
                 preds[i] = cand.item()
-            else:
-                if neighbor_scores is not None:
-                    if metric == 'cosine':
-                        sims = 1.0 - neighbor_scores[i]  # similarity
-                        best_lab, best_score = None, None
-                        for c in cand:
-                            score = sims[labs == c].sum()
-                            if (best_score is None) or (score > best_score):
-                                best_score = score
-                                best_lab = c
-                        preds[i] = best_lab.item()
-                    else:
-                        d = neighbor_scores[i]  # distances
-                        best_lab, best_score = None, None
-                        for c in cand:
-                            score = -(d[labs == c].sum())  # smaller total distance is better
-                            if (best_score is None) or (score > best_score):
-                                best_score = score
-                                best_lab = c
-                        preds[i] = best_lab.item()
+                continue
+
+            # Tie-break by aggregated score if available; else fall back to smallest label
+            if neighbor_scores is not None:
+                d_or_c = neighbor_scores[i]  # distances (cosine distance or l1/l2)
+                if metric == 'cosine':
+                    # Convert distance to similarity and clamp to avoid negative weights
+                    sims = (1.0 - d_or_c).clamp_min(0.0)
+                    best_lab, best_score = None, None
+                    for c in cand:
+                        score = sims[labs == c].sum()
+                        if (best_score is None) or (score > best_score + 0):  # strict >
+                            best_score = score
+                            best_lab = c
+                        elif best_score is not None and torch.isclose(score, best_score):
+                            # stable tie-break: smallest label
+                            best_lab = torch.minimum(best_lab, c)
+                    preds[i] = best_lab.item()
                 else:
-                    preds[i] = cand.min().item()
+                    # l1/l2: prefer smaller total distance -> compare negative sums
+                    d = d_or_c
+                    best_lab, best_score = None, None
+                    for c in cand:
+                        score = -(d[labs == c].sum())
+                        if (best_score is None) or (score > best_score + 0):
+                            best_score = score
+                            best_lab = c
+                        elif best_score is not None and torch.isclose(score, best_score):
+                            best_lab = torch.minimum(best_lab, c)
+                    preds[i] = best_lab.item()
+            else:
+                # No scores available: smallest label wins
+                preds[i] = cand.min().item()
 
         elif vote == 'distance':
             assert neighbor_scores is not None, "distance voting requires neighbor_scores"
+            d = neighbor_scores[i]
+
             if metric == 'cosine':
-                weights = 1.0 - neighbor_scores[i]  # similarity
+                # Use non-negative similarity as weights
+                weights = (1.0 - d).clamp_min(0.0) + eps
             else:
-                d = neighbor_scores[i]
                 weights = 1.0 / (d + eps)
 
             unique = torch.unique(labs)
             best_lab, best_w = None, None
             for c in unique:
                 w_sum = weights[labs == c].sum()
-                if (best_w is None) or (w_sum > best_w):
+                if (best_w is None) or (w_sum > best_w + 0):
                     best_w = w_sum
                     best_lab = c
+                elif best_w is not None and torch.isclose(w_sum, best_w):
+                    # stable tie-break: smallest label
+                    best_lab = torch.minimum(best_lab, c)
             preds[i] = best_lab.item()
+
         else:
             raise ValueError(f"Unknown vote: {vote}")
 

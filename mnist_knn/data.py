@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 r"""
 data.py
-—— 数据集的下载/读取/划分/张量化/设备管理（Windows 友好：使用原始字符串 docstring）
+Data loading, splitting, tensorization, and device-agnostic utilities.
 
-步骤2说明：
-- set_seed 由 main 在程序一开始调用，确保 train/val 划分可复现
-- 数据默认以 float32 存放；是否 half 由 main 统一转换，不在 data.py 中处理
+Notes:
+- Reproducibility: set_seed is expected to be called by the entry script.
+- Tensors are created as float32 by default; optional half precision casting is handled outside this module.
 """
 from __future__ import annotations
 from typing import Tuple, Dict
@@ -16,22 +16,25 @@ from torchvision import datasets, transforms
 
 
 def set_seed(seed: int = 0) -> None:
-    """设置随机种子以确保数据划分与实验可复现。"""
+    """Set random seeds for reproducible data splitting."""
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
 
 def _to_tensor(dataset: Dataset, flatten: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
-    """将 torchvision Dataset 转为 (X, y) 张量。flatten=True 时扁平化到 [784]。"""
+    """
+    Convert a torchvision Dataset to tensors (X, y).
+    If flatten=True, images are reshaped to [784]; otherwise keep [1, 28, 28].
+    """
     xs, ys = [], []
     for img, label in dataset:
         if flatten:
             xs.append(img.view(-1))  # -> [784]
         else:
-            xs.append(img)           # -> [1,28,28]
+            xs.append(img)           # -> [1, 28, 28]
         ys.append(label)
-    X = torch.stack(xs, dim=0).float()  # 默认 float32
+    X = torch.stack(xs, dim=0).float()  # float32 by default
     y = torch.tensor(ys, dtype=torch.long)
     return X, y
 
@@ -43,8 +46,8 @@ def load_mnist(
     seed: int = 0,
 ) -> Dict[str, torch.Tensor]:
     """
-    下载并加载 MNIST；从官方训练集随机抽取 10% 作为验证集，其余为训练集。
-    返回字典：X_train / y_train / X_val / y_val / X_test / y_test
+    Load MNIST and split the original training set into train/val, with val_ratio for validation.
+    Returns a dict with keys: X_train / y_train / X_val / y_val / X_test / y_test.
     """
     set_seed(seed)
     tfm = transforms.ToTensor()

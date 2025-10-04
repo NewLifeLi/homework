@@ -1,15 +1,21 @@
 # -*- coding: utf-8 -*-
 r"""
 experiments.py
-—— (e)(f) 网格搜索：超参数（k/metric/vote/batch_size）多配置试验 + 计时 + CSV 导出
-—— (g) 使用验证集最优超参在测试集上评估一次，并支持返回预测以导出
+Grid search over k / metric / vote / batch_size on the validation set with timing and CSV export.
+Evaluate the best configuration on the test set and optionally return predictions for downstream export.
 
-步骤3增强：
-- 运行开始回显搜索空间
-- CSV: runs/val_grid.csv（包含 k, metric, vote, batch_size, val_acc, val_time）
-- 选择规则固定：先 val_acc，再 val_time，再 k 更小，最后按 (metric, vote, batch_size) 字典序
-- 控制台打印 Top-3 概览与最佳条目
-- evaluate_on_test 返回 y_pred，便于主程序导出 runs/test_pred.pt
+Artifacts:
+- CSV: runs/val_grid.csv with fields {k, metric, vote, batch_size, val_acc, val_time}
+
+Selection rule:
+- Maximize val_acc
+- Tie-break by smaller val_time
+- Then smaller k
+- Then lexicographic order of (metric, vote, batch_size)
+
+Console output:
+- Top-3 configurations summary
+- Best configuration summary
 """
 from __future__ import annotations
 from typing import Sequence, Dict, Any, Tuple, List
@@ -26,7 +32,7 @@ def ensure_dir(path: str) -> None:
 
 
 def _sort_key(rec: Dict[str, Any]):
-    # 排序键：(-val_acc, val_time, k, metric, vote, batch_size)
+    # Sorting key: (-val_acc, val_time, k, metric, vote, batch_size)
     return (-rec["val_acc"], rec["val_time"], rec["k"], rec["metric"], rec["vote"], rec["batch_size"])
 
 
@@ -47,8 +53,8 @@ def run_grid_on_val(
     csv_path: str = "runs/val_grid.csv"
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """
-    在验证集上做网格搜索，返回最优条目（dict）及全部记录（list of dict）。
-    选择规则：最大化 val_acc；若相同更短 val_time；再相同 k 更小；再相同按 (metric, vote, batch_size) 字典序。
+    Run grid search on the validation set and return the best record with all records.
+    Selection rule: maximize val_acc; then smaller val_time; then smaller k; then (metric, vote, batch_size) lexicographic.
     """
     ensure_dir(os.path.dirname(csv_path))
     print("[VAL] search space:",
@@ -83,11 +89,11 @@ def run_grid_on_val(
                     if best is None:
                         best = rec
                     else:
-                        # 用排序键比较
+                        # Compare by the sorting key
                         if _sort_key(rec) < _sort_key(best):
                             best = rec
 
-    # 写 CSV
+    # Write CSV
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(records[0].keys()))
         writer.writeheader()
@@ -95,7 +101,7 @@ def run_grid_on_val(
             writer.writerow(r)
     print(f"[VAL] grid results saved to: {csv_path}")
 
-    # 打印 Top-3 与最佳
+    # Print Top-3 and best
     _print_top(records, topk=3)
     print("[VAL] best:", pretty_kv(best))
 
@@ -109,8 +115,8 @@ def evaluate_on_test(
     device: torch.device
 ) -> Dict[str, Any]:
     """
-    使用最优超参在测试集上评估一次。
-    返回：
+    Evaluate the best configuration on the test set.
+    Returns:
       {
         "test_acc": float,
         "test_time": float,

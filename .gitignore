@@ -1,0 +1,25 @@
+﻿# virtual env
+venv/
+.env/
+.venv/
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# notebooks
+.ipynb_checkpoints/
+
+# data & outputs
+data/
+runs/
+*.pt
+
+# os/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
